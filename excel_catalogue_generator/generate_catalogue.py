@@ -4,12 +4,18 @@ import io
 import time
 import urllib.request
 import urllib.error
+import gdown
+import re
 from urllib.parse import urlparse, parse_qs
 from reportlab.lib.pagesizes import A4, landscape
 from reportlab.lib import colors
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Image, Spacer, PageBreak
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import inch
+from pillow_heif import register_heif_opener
+
+# Register HEIF opener to handle .HEIC files (iPhone format)
+register_heif_opener()
 
 def get_direct_google_drive_link(url):
     """Converts a standard Google Drive sharing link into a direct download link."""
@@ -34,40 +40,96 @@ def get_direct_google_drive_link(url):
     
     return url
 
-def download_image(url):
-    """Downloads an image from a URL and returns an io.BytesIO object, or None if failed."""
-    if pd.isna(url) or not str(url).strip():
+def get_drive_folder_map(folder_url):
+    """Parses a public Google Drive folder page for file IDs and names."""
+    if not folder_url or "YOUR_FOLDER_ID_HERE" in folder_url:
+        return {}
+        
+    print(f"Mapping Google Drive folder: {folder_url}")
+    try:
+        # Extract folder ID
+        if "/folders/" in folder_url:
+            folder_id = folder_url.split("/folders/")[1].split("?")[0].split("/")[0]
+        else:
+            folder_id = folder_url
+            
+        # Use the embedded view which is more predictable for scraping
+        embed_url = f"https://drive.google.com/embeddedfolderview?id={folder_id}"
+        req = urllib.request.Request(embed_url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req) as response:
+            html = response.read().decode('utf-8')
+            
+        # Regex to find name-ID pairs in the embedded view
+        # Fallback 1: entry-ID ... followed by the filename in a class or aria-label
+        # We look for entry-ID then any tag until we find a filename with extension
+        pairs = re.findall(r'entry-([a-zA-Z0-9\-_]{28,}).+?(?:\>|\")( [^\"]+\.[a-zA-Z0-9]{3,4})[\"<]', html, re.DOTALL)
+        
+        # Fallback 2: ["ID","FILENAME",null,"TYPE"]
+        if not pairs:
+             pairs = re.findall(r'\[\"([a-zA-Z0-9\-_]{28,})\"\,\"([^\"]+\.[a-zA-Z0-9]{3,4})\"', html)
+             
+        file_map = {}
+        for fid, name in pairs:
+            lname = name.strip().lower()
+            if lname.endswith(('.heic', '.jpg', '.png', '.jpeg', '.webp')):
+                file_map[lname] = fid
+                
+        if len(file_map) > 0:
+            print(f"Found {len(file_map)} high-res images in cloud folder.")
+        else:
+            print("No images found. Check if the folder is public ('Anyone with link').")
+            
+        return file_map
+    except Exception as e:
+        print(f"⚠️ Error mapping Drive folder: {e}")
+        return {}
+
+def download_image(url_or_name, item_name, drive_map=None):
+    """Downloads an image from a URL or fetches it from the Google Drive map."""
+    if pd.isna(url_or_name) or not str(url_or_name).strip():
         return None
         
-    url = str(url).strip()
-    direct_url = get_direct_google_drive_link(url)
+    val = str(url_or_name).strip()
+    
+    # 1. Check if the value is a filename that exists in our Drive map
+    if drive_map and val.lower() in drive_map:
+        file_id = drive_map[val.lower()]
+        direct_url = f"https://drive.google.com/uc?export=download&id={file_id}"
+    elif val.startswith(('http://', 'https://')):
+        # 2. Otherwise treat as a direct URL
+        direct_url = get_direct_google_drive_link(val)
+    else:
+        # 3. If it's just a filename but not in the map
+        return None
     
     try:
-        # Add a headers dictionary with a User-Agent to avoid 403 Forbidden
         req = urllib.request.Request(
             direct_url, 
             headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
         )
-        response = urllib.request.urlopen(req, timeout=10)
+        response = urllib.request.urlopen(req, timeout=15)
         return io.BytesIO(response.read())
     except Exception as e:
-        print(f"Failed to download image from {url}: {e}")
+        print(f"Failed to fetch image for {item_name}: {e}")
         return None
 
-def generate_catalogue(sheet_url, output_pdf="catalogue.pdf"):
+def generate_catalogue(sheet_url, drive_folder_url, output_pdf="catalogue.pdf"):
     print(f"Fetching data from: {sheet_url}")
+    # Initialize Drive Folder Mapping
+    drive_map = get_drive_folder_map(drive_folder_url)
+    
     try:
         df = pd.read_csv(sheet_url)
         df = df.dropna(how='all')
-        print(f"✅ Successfully fetched {len(df)} row(s) from Google Sheets.")
+        print(f"Successfully fetched {len(df)} row(s) from Google Sheets.")
         if len(df) > 0:
-            print("📋 First 3 items found in the data:")
+            print("First 3 items found in the data:")
             for i, row in df.head(3).iterrows():
                 brand = str(row.get('Brand', 'N/A'))
                 item_type = str(row.get('Type', 'N/A'))
                 print(f"   - {brand} {item_type}")
     except Exception as e:
-        print(f"❌ Error fetching data: {e}")
+        print(f"Error fetching data: {e}")
         return
 
     page_width, page_height = landscape(A4)
@@ -243,8 +305,8 @@ def generate_catalogue(sheet_url, output_pdf="catalogue.pdf"):
         # Build Image
         image_content = []
         if img_url:
-            print(f"Downloading image for {name_text}...")
-            img_data = download_image(img_url)
+            print(f"Processing image for {name_text}...")
+            img_data = download_image(img_url, name_text, drive_map)
             if img_data:
                 try:
                     # reportlab Image takes a file-like object
@@ -301,13 +363,17 @@ def generate_catalogue(sheet_url, output_pdf="catalogue.pdf"):
     try:
         # Build without the static on_page_header
         doc.build(story)
-        print(f"✅ Successfully generated PDF catalogue: {os.path.abspath(output_pdf)}")
+        print(f"Successfully generated PDF catalogue: {os.path.abspath(output_pdf)}")
     except Exception as e:
-        print(f"❌ Error generating PDF: {e}")
+        print(f"Error generating PDF: {e}")
 
 
 if __name__ == "__main__":
-    google_sheet_url = "https://docs.google.com/spreadsheets/d/1ptPQnyNY0u17OZ-cBlRC6bbq46--bMobL4Xog5wML7E/edit?usp=sharing"
+    # Your Google Sheet Link
+    google_sheet_url = "https://docs.google.com/spreadsheets/d/1B36VgxQtWhbVRpVv2ZtSEj1tJvcZ5iOg3jxn0lj3UC8/edit?usp=sharing"
+    
+    # [ACTION REQUIRED] Paste your Public Google Drive Folder Link here
+    GOOGLE_DRIVE_FOLDER_URL = "https://drive.google.com/drive/folders/1hsg2UdJDhzWySvGo7YjMJr9l6LZtmK-o?usp=sharing"
     
     # We will automatically convert the sharing link into a direct CSV download link
     def get_csv_export_url(url):
@@ -320,4 +386,4 @@ if __name__ == "__main__":
     
     csv_url = get_csv_export_url(google_sheet_url)
     output_pdf_path = "catalogue.pdf"
-    generate_catalogue(csv_url, output_pdf_path)
+    generate_catalogue(csv_url, GOOGLE_DRIVE_FOLDER_URL, output_pdf_path)

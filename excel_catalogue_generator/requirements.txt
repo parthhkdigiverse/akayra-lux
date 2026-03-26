@@ -1,2 +1,6 @@
 pandas
 openpyxl
+requests
+reportlab
+pillow-heif
+gdown
