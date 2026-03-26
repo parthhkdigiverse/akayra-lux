@@ -9,13 +9,55 @@ import re
 from urllib.parse import urlparse, parse_qs
 from reportlab.lib.pagesizes import A4, landscape
 from reportlab.lib import colors
-from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Image, Spacer, PageBreak
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Image, Spacer, PageBreak, Flowable
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import inch
 from pillow_heif import register_heif_opener
 
 # Register HEIF opener to handle .HEIC files (iPhone format)
 register_heif_opener()
+
+class RoundedBadge(Flowable):
+    def __init__(self, text):
+        Flowable.__init__(self)
+        self.text = text
+        self.style = ParagraphStyle('BadgeStyle', fontSize=15, fontName='Helvetica', textColor=colors.black)
+        self.p = Paragraph(self.text, self.style)
+
+    def wrap(self, availWidth, availHeight):
+        w, h = self.p.wrap(availWidth, availHeight)
+        self.width = w + 16
+        self.height = 24
+        return self.width, self.height
+
+    def draw(self):
+        self.canv.saveState()
+        self.canv.setFillColor(colors.HexColor('#fedac2'))
+        self.canv.setStrokeColor(colors.HexColor('#fedac2'))
+        self.canv.roundRect(0, 0, self.width, self.height, 6, fill=1, stroke=0)
+        self.p.drawOn(self.canv, 8, (self.height - 18)/2.0 - 1)
+        self.canv.restoreState()
+
+class ImageBox(Flowable):
+    def __init__(self, img_flowable, width, height, bg_color='#e8e8e8', radius=12):
+        Flowable.__init__(self)
+        self.img = img_flowable
+        self.width = width
+        self.height = height
+        self.bg_color = bg_color
+        self.radius = radius
+
+    def wrap(self, availWidth, availHeight):
+        return self.width, self.height
+
+    def draw(self):
+        self.canv.saveState()
+        self.canv.setFillColor(colors.HexColor(self.bg_color))
+        self.canv.setStrokeColor(colors.HexColor(self.bg_color))
+        self.canv.roundRect(0, 0, self.width, self.height, self.radius, fill=1, stroke=0)
+        img_w, img_h = self.img.wrap(self.width, self.height)
+        self.img.drawOn(self.canv, (self.width - img_w)/2.0, (self.height - img_h)/2.0)
+        self.canv.restoreState()
 
 def get_direct_google_drive_link(url):
     """Converts a standard Google Drive sharing link into a direct download link."""
@@ -167,9 +209,8 @@ def generate_catalogue(sheet_url, drive_folder_url, output_pdf="catalogue.pdf"):
         'ItemPrice',
         parent=styles['Normal'],
         fontSize=22,
-        textColor=colors.HexColor('#d32f2f'),
-        fontName='Helvetica-Bold',
-        spaceBefore=25
+        textColor=colors.HexColor('#9e1c1c'),
+        fontName='Helvetica-Bold'
     )
     
     footer_style = ParagraphStyle(
@@ -177,9 +218,8 @@ def generate_catalogue(sheet_url, drive_folder_url, output_pdf="catalogue.pdf"):
         parent=styles['Normal'],
         fontSize=18,
         fontName='Helvetica-Oblique',
-        textColor=colors.HexColor('#e67e22'), # Orange
-        alignment=1, # Center
-        spaceBefore=25
+        textColor=colors.HexColor('#c48b4b'), # Orange
+        alignment=0 # Left
     )
     
     # Styles for dynamic header
@@ -284,23 +324,39 @@ def generate_catalogue(sheet_url, drive_folder_url, output_pdf="catalogue.pdf"):
         # Build Text details
         name_text = f"{brand} {item_type}".strip().upper()
         
-        # Strikethrough for original price if it exists
         orig_price_str = f"<strike>{orig_price}</strike>" if orig_price != "N/A" else "N/A"
 
-        details_html = f"""
-        <font color="#888888">Type:</font> &nbsp;&nbsp;&nbsp;&nbsp;&nbsp; {item_type}<br/>
-        <font color="#888888">Size:</font> &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; {size}<br/>
-        <font color="#888888">Color:</font> &nbsp;&nbsp;&nbsp;&nbsp; {color}<br/>
-        <font color="#888888">Original:</font> &nbsp; {orig_price_str}<br/>
-        """
+        detail_data = [
+            [Paragraph("<font color='#000000'>Type:</font>", detail_style), Paragraph(item_type, detail_style)],
+            [Paragraph("<font color='#000000'>Size:</font>", detail_style), Paragraph(size, detail_style)],
+            [Paragraph("<font color='#000000'>Color:</font>", detail_style), Paragraph(color, detail_style)],
+            [Paragraph("<font color='#000000'>Original:</font>", detail_style), Paragraph(orig_price_str, detail_style)]
+        ]
+        
+        detail_table = Table(detail_data, colWidths=[80, 250])
+        detail_table.setStyle(TableStyle([
+            ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
+            ('LEFTPADDING', (0,0), (-1,-1), 0),
+            ('RIGHTPADDING', (0,0), (-1,-1), 0),
+            ('BOTTOMPADDING', (0,0), (-1,-1), 5),
+            ('TOPPADDING', (0,0), (-1,-1), 5),
+        ]))
         
         price_html = f"Our Price: {sell_price}"
         
-        text_content = [
+        text_elements = [
             Paragraph(name_text, title_style),
-            Paragraph(details_html, detail_style),
+            Spacer(1, 15),
+            detail_table,
+            Spacer(1, 25),
             Paragraph(price_html, price_style)
         ]
+        
+        if unit and unit not in ["N/A", "0"]:
+            footer_text = f"Hurry Up! Only {unit} pieces left"
+            text_elements.extend([Spacer(1, 20), Paragraph(footer_text, footer_style)])
+            
+        text_content = text_elements
         
         # Build Image
         image_content = []
@@ -318,14 +374,19 @@ def generate_catalogue(sheet_url, drive_folder_url, output_pdf="catalogue.pdf"):
                     aspect = rl_img.imageWidth / float(rl_img.imageHeight)
                     
                     # Fit within bounds while preserving aspect ratio
-                    if (max_width / aspect) <= max_height:
-                        rl_img.drawWidth = max_width
-                        rl_img.drawHeight = max_width / aspect
+                    box_padding = 20
+                    actual_max_width = max_width - box_padding * 2
+                    actual_max_height = max_height - box_padding * 2
+                    
+                    if (actual_max_width / aspect) <= actual_max_height:
+                        rl_img.drawWidth = actual_max_width
+                        rl_img.drawHeight = actual_max_width / aspect
                     else:
-                        rl_img.drawHeight = max_height
-                        rl_img.drawWidth = max_height * aspect
+                        rl_img.drawHeight = actual_max_height
+                        rl_img.drawWidth = actual_max_height * aspect
                         
-                    image_content.append(rl_img)
+                    rounded_box = ImageBox(rl_img, rl_img.drawWidth + box_padding*2, rl_img.drawHeight + box_padding*2)
+                    image_content.append(rounded_box)
                 except Exception as e:
                     print(f"Error processing image for {name_text}: {e}")
                     image_content.append(Paragraph("<i>Image format error</i>", styles['Normal']))
@@ -344,19 +405,18 @@ def generate_catalogue(sheet_url, drive_folder_url, output_pdf="catalogue.pdf"):
         item_table = Table([[image_content, text_content]], colWidths=[col_width, col_width])
         item_table.setStyle(TableStyle([
             ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
-            ('BOX', (0,0), (-1,-1), 1, colors.HexColor('#eeeeee')),
-            ('LINEAFTER', (0,0), (0,-1), 1, colors.HexColor('#eeeeee')),
-            ('PADDING', (0,0), (-1,-1), 30),
-            ('BACKGROUND', (0,0), (-1,-1), colors.white),
-            ('BACKGROUND', (0,0), (0,-1), colors.HexColor('#fafafa')), # Light gray behind image
+            ('PADDING', (0,0), (-1,-1), 20),
         ]))
         
         story.append(item_table)
+        story.append(Spacer(1, 40))
         
-        if unit and unit not in ["N/A", "0"]:
-            footer_text = f"Hurry Up! Only {unit} pieces left"
-            story.append(Paragraph(footer_text, footer_style))
-            
+        bottom_line = Table([[""]], colWidths=[page_width - 80])
+        bottom_line.setStyle(TableStyle([
+            ('LINEBELOW', (0,0), (-1,-1), 1.0, colors.HexColor('#e0e0e0'))
+        ]))
+        story.append(bottom_line)
+        
         story.append(PageBreak())
 
     print("Building PDF...")
