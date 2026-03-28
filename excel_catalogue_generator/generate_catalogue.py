@@ -6,10 +6,12 @@ import urllib.request
 import urllib.error
 import gdown
 import re
+from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlparse, parse_qs
 from reportlab.lib.pagesizes import A4, landscape
 from reportlab.lib import colors
-from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Image, Spacer, PageBreak, Flowable
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Image as RLImage, Spacer, PageBreak, Flowable
+from PIL import Image as PILImage
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import inch
 from pillow_heif import register_heif_opener
@@ -102,17 +104,22 @@ def get_drive_folder_map(folder_url):
             html = response.read().decode('utf-8')
             
         # Regex to find name-ID pairs in the embedded view
-        # Fallback 1: entry-ID ... followed by the filename in a class or aria-label
-        # We look for entry-ID then any tag until we find a filename with extension
-        pairs = re.findall(r'entry-([a-zA-Z0-9\-_]{28,}).+?(?:\>|\")( [^\"]+\.[a-zA-Z0-9]{3,4})[\"<]', html, re.DOTALL)
+        # The structure is: id="entry-ID" ... <div class="flip-entry-title">FILENAME</div>
+        pairs = re.findall(r'id="entry-([a-zA-Z0-9\-_]{20,})".+?<div class="flip-entry-title">([^<]+)</div>', html, re.DOTALL)
         
-        # Fallback 2: ["ID","FILENAME",null,"TYPE"]
+        # Fallback for filenames that might be in JSON-like structure or other attributes
         if not pairs:
-             pairs = re.findall(r'\[\"([a-zA-Z0-9\-_]{28,})\"\,\"([^\"]+\.[a-zA-Z0-9]{3,4})\"', html)
+             pairs = re.findall(r'\[\"([a-zA-Z0-9\-_]{20,})\"\,\"([^\"]+\.[a-zA-Z0-9]{3,4})\"', html)
              
         file_map = {}
         for fid, name in pairs:
-            lname = name.strip().lower()
+            # Google Drive filenames in the folder view sometimes have "Copy of " prefix
+            # or trailing spaces. We strip and normalize.
+            clean_name = name.strip()
+            if clean_name.startswith("Copy of "):
+                clean_name = clean_name[len("Copy of "):].strip()
+            
+            lname = clean_name.lower()
             if lname.endswith(('.heic', '.jpg', '.png', '.jpeg', '.webp')):
                 file_map[lname] = fid
                 
@@ -126,34 +133,94 @@ def get_drive_folder_map(folder_url):
         print(f"⚠️ Error mapping Drive folder: {e}")
         return {}
 
+CACHE_DIR = "image_cache"
+if not os.path.exists(CACHE_DIR):
+    os.makedirs(CACHE_DIR)
+
+image_cache = {}
+
 def download_image(url_or_name, item_name, drive_map=None):
-    """Downloads an image from a URL or fetches it from the Google Drive map."""
+    """Downloads an image from a URL or fetches it from the Google Drive map with local caching."""
     if pd.isna(url_or_name) or not str(url_or_name).strip():
         return None
         
     val = str(url_or_name).strip()
+    cache_key = val.lower()
     
-    # 1. Check if the value is a filename that exists in our Drive map
+    # 1. Check in-memory cache
+    if cache_key in image_cache:
+        return io.BytesIO(image_cache[cache_key])
+    
+    # 2. Check persistent disk cache
+    # Create a safe filename for the identifier
+    safe_filename = re.sub(r'[^a-zA-Z0-9\._\-]', '_', val)
+    if not any(safe_filename.lower().endswith(ext) for ext in ['.jpg', '.jpeg', '.png', '.heic', '.webp']):
+        # If it doesn't have an extension, try to infer or just add .img
+        safe_filename += ".img"
+    
+    cache_path = os.path.join(CACHE_DIR, safe_filename)
+    if os.path.exists(cache_path):
+        try:
+            with open(cache_path, "rb") as f:
+                data = f.read()
+                image_cache[cache_key] = data
+                print(f"   [CACHE] Found {val} in local storage.")
+                return io.BytesIO(data)
+        except:
+             pass
+
+    # 3. Determine if it's a Drive file or a direct URL
     if drive_map and val.lower() in drive_map:
         file_id = drive_map[val.lower()]
         direct_url = f"https://drive.google.com/uc?export=download&id={file_id}"
     elif val.startswith(('http://', 'https://')):
-        # 2. Otherwise treat as a direct URL
         direct_url = get_direct_google_drive_link(val)
     else:
-        # 3. If it's just a filename but not in the map
         return None
     
-    try:
-        req = urllib.request.Request(
-            direct_url, 
-            headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-        )
-        response = urllib.request.urlopen(req, timeout=15)
-        return io.BytesIO(response.read())
-    except Exception as e:
-        print(f"Failed to fetch image for {item_name}: {e}")
-        return None
+    print(f"   [DOWNLOAD] Fetching {val}...")
+    
+    final_data = None
+    
+    # Attempt 1: gdown
+    if "drive.google.com" in direct_url:
+        try:
+            output = io.BytesIO()
+            file_id_match = re.search(r'id=([a-zA-Z0-9\-_]{20,})', direct_url)
+            if file_id_match:
+                fid = file_id_match.group(1)
+                gdown.download(id=fid, output=output, quiet=True)
+                output.seek(0)
+                if output.getbuffer().nbytes > 0:
+                    final_data = output.read()
+        except:
+            pass
+            
+    # Attempt 2: urllib fallback
+    if not final_data:
+        try:
+            req = urllib.request.Request(
+                direct_url, 
+                headers={'User-Agent': 'Mozilla/5.0'}
+            )
+            with urllib.request.urlopen(req, timeout=15) as response:
+                final_data = response.read()
+        except Exception as e:
+            print(f"   [FAIL] Error fetching {val}: {e}")
+            
+    if final_data:
+        # Save to caches
+        image_cache[cache_key] = final_data
+        try:
+            with open(cache_path, "wb") as f:
+                f.write(final_data)
+        except Exception as e:
+            print(f"   [WARN] Could not save cache for {val}: {e}")
+            
+        print(f"   [OK] Downloaded {val}")
+        return io.BytesIO(final_data)
+        
+    return None
 
 def generate_catalogue(sheet_url, drive_folder_url, output_pdf="catalogue.pdf"):
     print(f"Fetching data from: {sheet_url}")
@@ -164,12 +231,25 @@ def generate_catalogue(sheet_url, drive_folder_url, output_pdf="catalogue.pdf"):
         df = pd.read_csv(sheet_url)
         df = df.dropna(how='all')
         print(f"Successfully fetched {len(df)} row(s) from Google Sheets.")
-        if len(df) > 0:
-            print("First 3 items found in the data:")
-            for i, row in df.head(3).iterrows():
-                brand = str(row.get('Brand', 'N/A'))
-                item_type = str(row.get('Type', 'N/A'))
-                print(f"   - {brand} {item_type}")
+        
+        # --- Pre-download images in parallel ---
+        all_img_refs = []
+        for _, row in df.iterrows():
+            ai_photo = str(row.get('AI Photo', '')).strip()
+            perfect_photo = str(row.get('Perfect Photo Or Link', '')).strip()
+            photo = str(row.get('Photo', '')).strip()
+            for p in [ai_photo, perfect_photo, photo]:
+                if p and p.lower() != 'nan':
+                    all_img_refs.append(p)
+        
+        unique_refs = list(set(all_img_refs))
+        if unique_refs:
+            print(f"Pre-downloading {len(unique_refs)} unique images in parallel...")
+            with ThreadPoolExecutor(max_workers=10) as executor:
+                # Use item_name="Pre-download" for all since we just want them cached
+                executor.map(lambda ref: download_image(ref, "Pre-download", drive_map), unique_refs)
+            print("Pre-download complete.")
+            
     except Exception as e:
         print(f"Error fetching data: {e}")
         return
@@ -267,6 +347,8 @@ def generate_catalogue(sheet_url, drive_folder_url, output_pdf="catalogue.pdf"):
         uid = clean_val(row.get('UID'))
         brand = clean_val(row.get('Brand'), 'Unknown')
         item_type = clean_val(row.get('Type'), '')
+        
+        print(f"[{index+1}/{len(df)}] Generating PDF page for: {brand} {item_type}")
         size = clean_val(row.get('Size'))
         color = clean_val(row.get('Color'))
         orig_price = clean_val(row.get('Original Price'))
@@ -291,7 +373,7 @@ def generate_catalogue(sheet_url, drive_folder_url, output_pdf="catalogue.pdf"):
         logo_path = "akayra_logo.png"
         if os.path.exists(logo_path):
             # Scale logo to reasonable header size (e.g., 1.2 inches wide)
-            logo_img = Image(logo_path)
+            logo_img = RLImage(logo_path)
             logo_aspect = logo_img.imageWidth / float(logo_img.imageHeight)
             logo_img.drawWidth = 1.2 * inch
             logo_img.drawHeight = (1.2 * inch) / logo_aspect
@@ -361,12 +443,24 @@ def generate_catalogue(sheet_url, drive_folder_url, output_pdf="catalogue.pdf"):
         # Build Image
         image_content = []
         if img_url:
-            print(f"Processing image for {name_text}...")
             img_data = download_image(img_url, name_text, drive_map)
             if img_data:
                 try:
+                    # Convert to PIL Image first to handle HEIF and other formats
+                    # then convert to JPEG for stable ReportLab embedding
+                    pil_img = PILImage.open(img_data)
+                    
+                    # Ensure RGB mode (JPEG doesn't support transparency/alpha well in many PDF viewers)
+                    if pil_img.mode != "RGB":
+                        pil_img = pil_img.convert("RGB")
+                    
+                    # Save to a new buffer as JPEG
+                    optimized_img_io = io.BytesIO()
+                    pil_img.save(optimized_img_io, format="JPEG", quality=85)
+                    optimized_img_io.seek(0)
+                    
                     # reportlab Image takes a file-like object
-                    rl_img = Image(img_data)
+                    rl_img = RLImage(optimized_img_io)
                     # Maximize image size to fill left half of the page
                     max_width = (page_width - 120) / 2.0  # Column width minus padding
                     max_height = page_height - 200        # Page height minus margin/header

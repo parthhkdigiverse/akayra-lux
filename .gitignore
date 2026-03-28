@@ -150,6 +150,10 @@ cython_debug/
 .vscode/
 
 # Project Specific
-catalogue.pdf
+*.pdf
+image_cache/
+drive_debug.html
+.DS_Store
 catalogue_from_sheets.html
-akayra_logo.png
+/excel_catalogue_generator/image_cache/
+/excel_catalogue_generator/*.pdf
