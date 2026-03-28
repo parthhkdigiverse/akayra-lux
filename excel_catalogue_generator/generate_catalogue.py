@@ -400,7 +400,7 @@ def generate_catalogue(sheet_url, drive_folder_url, output_pdf="catalogue.pdf"):
         ]))
         
         story.append(header_table)
-        story.append(Spacer(1, 40))
+        story.append(Spacer(1, 20))
         
         # 2. GENERATE ITEM CONTENT
         # Build Text details
@@ -463,7 +463,7 @@ def generate_catalogue(sheet_url, drive_folder_url, output_pdf="catalogue.pdf"):
                     rl_img = RLImage(optimized_img_io)
                     # Maximize image size to fill left half of the page
                     max_width = (page_width - 120) / 2.0  # Column width minus padding
-                    max_height = page_height - 200        # Page height minus margin/header
+                    max_height = page_height - 300        # Page height minus margin/header
                     
                     aspect = rl_img.imageWidth / float(rl_img.imageHeight)
                     
@@ -499,11 +499,11 @@ def generate_catalogue(sheet_url, drive_folder_url, output_pdf="catalogue.pdf"):
         item_table = Table([[image_content, text_content]], colWidths=[col_width, col_width])
         item_table.setStyle(TableStyle([
             ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
-            ('PADDING', (0,0), (-1,-1), 20),
+            ('PADDING', (0,0), (-1,-1), 10),
         ]))
         
         story.append(item_table)
-        story.append(Spacer(1, 40))
+        story.append(Spacer(1, 15))
         
         bottom_line = Table([[""]], colWidths=[page_width - 80])
         bottom_line.setStyle(TableStyle([
